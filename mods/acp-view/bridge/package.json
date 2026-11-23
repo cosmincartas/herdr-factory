@@ -1,0 +1,13 @@
+{
+  "name": "herdr-acp-view-bridge",
+  "private": true,
+  "type": "module",
+  "description": "Runs claude-agent-acp as an ACP client and serves its session to the acp-view Herdr mod over a loopback WebSocket.",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.107.3",
+    "@resvg/resvg-js": "2.6.2",
+    "beautiful-mermaid": "1.1.3",
+    "diff": "9.0.0",
+    "ws": "8.18.3"
+  }
+}

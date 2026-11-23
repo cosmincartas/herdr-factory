@@ -1,0 +1,6 @@
+# Installed by the bridge on first start (npm install in mods/acp-view/bridge)
+node_modules/
+# Herdr writes the API types into each mod folder; they follow the app version
+gpui-kit.d.ts
+# Herdr's load errors for a layout or mod
+*.error
