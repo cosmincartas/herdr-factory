@@ -1,0 +1,19 @@
+{
+  "place": "none",
+  "title": "Port forwards",
+  "link_handlers": [
+    {
+      "kind": "url",
+      "pattern": "^https?://(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]):[0-9]+([/?#]|$)"
+    }
+  ],
+  "palette": [
+    {
+      "title": "Port forwards",
+      "command": "mod.open",
+      "args": { "name": "port-forward" },
+      "words": "ssh tunnel ports"
+    }
+  ],
+  "overlay": { "kind": "dialog", "width": 520, "height": 420 }
+}

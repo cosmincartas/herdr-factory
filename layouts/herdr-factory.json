@@ -186,6 +186,7 @@
   ],
   "preview": "layouts/herdr-factory.svg",
   "link_handlers": [
-    "herdr-explorer"
+    "herdr-explorer",
+    "port-forward"
   ]
 }
