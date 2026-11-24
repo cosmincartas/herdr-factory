@@ -12,6 +12,10 @@ Herdr's `main` layout plus:
   their sub-agents nested.
 - A keyboard-driven file explorer in the side panel's Files slot that opens
   files in Helix (`herdr-explorer`), and Ctrl+click on terminal paths into Helix.
+- Ctrl+click on a `localhost` URL with a port in a terminal on an SSH machine
+  forwards that port to this computer and opens the page in the browser
+  (`port-forward`). The **Port forwards** command-palette entry (search
+  "ssh tunnel ports") opens a dialog that adds, lists and stops forwards.
 - A start-point picker in the New worktree dialog (`factory-worktree`).
 - A tmux-style `Ctrl+B` prefix (`herdr-tui-prefix`).
 
@@ -28,6 +32,7 @@ Herdr's `main` layout plus:
 | `mods/acp-view/` | Claude Code over ACP, drawn natively; see its README |
 | `mods/herdr-explorer/` | File explorer and Ctrl+click handler that open files in Helix; see its README |
 | `mods/herdr-tui-prefix/` | `Ctrl+B` prefix popup, tmux-style; see its README |
+| `mods/port-forward/` | Ctrl+click forwards a remote `localhost` port and opens the page; **Port forwards** dialog adds, lists and stops forwards |
 
 The `factory-*` mods are clones of Herdr's shipped mods (`cloned_from` in
 each `mod.json` gives the version). Herdr never updates clones: after a Herdr
@@ -61,6 +66,8 @@ Some mods also need setup outside this repo:
   `space e` to reveal) and optionally `alt-e` in `keys.json`; see its README.
 - `herdr-tui-prefix`: the `ctrl-b` bindings in `~/.config/herdr-app/keys.json`;
   see its README.
+- `port-forward`: an SSH machine from `hc machine ls` with key or agent
+  authentication and a known host key, plus Linux `ss` and `xdg-open`.
 
 `acp-view` needs:
 
@@ -86,3 +93,13 @@ Some mods also need setup outside this repo:
 - New worktree from a space's right-click menu (Herdr's `menu` mod, opened by
   `spaces`) still opens Herdr's `worktree`, without the start-point picker. Only
   the tab bar's + menu opens `factory-worktree`.
+
+- `port-forward` forwards only when you Ctrl+click a loopback URL or add one in
+  the dialog; it doesn't watch terminals or remote machines for new ports or
+  URLs.
+- Machines added with `--via` (no SSH target) can't be forwarded; only SSH
+  machines can.
+- A forward outlives the Herdr window: it stops from the dialog or when its
+  `ssh` exits, whichever comes first.
+- A forward whose `ssh` exits, for example after a network drop, is not
+  restarted; the next Ctrl+click or dialog add starts a new one.
