@@ -1,0 +1,49 @@
+#!/bin/sh
+# Helix's side of herdr-explorer.
+#
+#   herdr-explorer take          print the file the explorer queued for this terminal, then forget it
+#                                (Helix: F12 = ":open %sh{herdr-explorer take}")
+#   herdr-explorer reveal PATH   show PATH in the explorer and make this Helix the one files open in
+#                                (Helix: space e = ":sh herdr-explorer reveal %{buffer_name}")
+#   herdr-explorer find [TEXT]   open the explorer panel on Find files
+#   herdr-explorer search [TEXT] open the explorer panel on Search (file contents)
+#
+# Files live in $XDG_RUNTIME_DIR/herdr-explorer, keyed by HC_TERMINAL_ID (set in every hc terminal).
+set -eu
+dir="${XDG_RUNTIME_DIR:-/tmp}/herdr-explorer"
+id="${HC_TERMINAL_ID:-}"
+
+case "${1:-}" in
+  take)
+    [ -n "$id" ] && [ -f "$dir/$id" ] || { echo "herdr-explorer: nothing queued" >&2; exit 1; }
+    cat "$dir/$id"
+    rm -f "$dir/$id"
+    ;;
+  reveal)
+    [ $# -ge 2 ] || { echo "usage: herdr-explorer reveal PATH" >&2; exit 2; }
+    # Helix's :sh hands %{buffer_name} to the shell unquoted, so a name with spaces
+    # arrives as several words: put them back together.
+    shift
+    path="$*"
+    case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+    mkdir -p "$dir"
+    printf '%s\t%s\t%s\n' "$id" "$path" "$(date +%s%N)" > "$dir/reveal.tmp"
+    mv -f "$dir/reveal.tmp" "$dir/reveal"
+    # Wakes the explorer at once; its folder watch picks the request up otherwise.
+    herdr-app do herdr-explorer.reveal >/dev/null 2>&1 || true
+    ;;
+  find|search)
+    # Show the explorer in herdr-factory's side panel (Files slot), then start Find files or Search.
+    herdr-app do layout.select '{"stack":"panel-body","child":"files"}' >/dev/null 2>&1 || true
+    herdr-app do layout.show '{"id":"panel"}' >/dev/null 2>&1 || true
+    sleep 0.3  # a panel shown for the first time starts its mod now
+    [ "$1" = find ] && cmd=find-files || cmd=search
+    shift
+    [ $# -gt 0 ] && cmd="$cmd:$*"  # start with this text (Helix: %{selection}, say)
+    herdr-app do "herdr-explorer.$cmd" >/dev/null 2>&1 || true
+    ;;
+  *)
+    echo "usage: herdr-explorer take | reveal PATH | find | search" >&2
+    exit 2
+    ;;
+esac

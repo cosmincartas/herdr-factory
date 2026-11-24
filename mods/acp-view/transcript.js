@@ -1,6 +1,8 @@
 // Folds the bridge's event stream (ACP session/update payloads plus a few
 // bridge events) into a list of transcript items the view draws.
 
+import { formFields } from "./questions.js";
+
 export class Transcript {
   constructor() {
     this.reset();
@@ -10,6 +12,7 @@ export class Transcript {
     this.items = [];
     this.tools = new Map();
     this.perms = new Map();
+    this.questions = new Map();
     this.session = null;
     this.mode = null;
     this.config = [];
@@ -33,6 +36,12 @@ export class Transcript {
 
   get pendingPermission() {
     for (const p of this.perms.values()) if (p.answer === undefined) return p;
+    return null;
+  }
+
+  // The oldest question still waiting for an answer (the panel above the composer).
+  get pendingQuestion() {
+    for (const q of this.questions.values()) if (q.answer === undefined) return q;
     return null;
   }
 
@@ -60,6 +69,17 @@ export class Transcript {
       case "permit_done": {
         const p = this.perms.get(ev.id);
         if (p) p.answer = ev.optionId;
+        break;
+      }
+      case "question": {
+        const item = { kind: "question", id: ev.id, toolCallId: ev.toolCallId ?? null, message: ev.message ?? "", fields: formFields(ev.schema), answer: undefined };
+        this.questions.set(ev.id, item);
+        this.items.push(item);
+        break;
+      }
+      case "question_done": {
+        const q = this.questions.get(ev.id);
+        if (q) q.answer = { action: ev.action, content: ev.content ?? null };
         break;
       }
       case "turn_end":

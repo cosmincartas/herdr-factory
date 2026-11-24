@@ -1,30 +1,42 @@
 #!/usr/bin/env bash
 # Links this repo's layout and mods into Herdr's home, so Herdr reads them
-# from here. Safe to run again. Anything already there that isn't a link to
-# this repo is moved aside as <name>.pre-herdr-factory-<time>.
+# from here, and herdr-explorer's Helix helper into ~/.local/bin. Safe to run
+# again. A link that points elsewhere is replaced; anything else already there
+# is moved to <home>/.pre-herdr-factory/<time>/ (outside mods/, so Herdr
+# doesn't load the backup as a mod).
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 home="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+bin="$HOME/.local/bin"
 stamp="$(date +%Y%m%d-%H%M%S)"
+backup="$home/.pre-herdr-factory/$stamp"
 
+# link <source> <destination> <label>
 link() {
-  local src="$repo/$1" dst="$home/$1"
+  local src="$1" dst="$2" label="$3"
   mkdir -p "$(dirname "$dst")"
   if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
-    echo "ok      $1"
+    echo "ok      $label"
     return
   fi
-  if [ -e "$dst" ] || [ -L "$dst" ]; then
-    mv "$dst" "$dst.pre-herdr-factory-$stamp"
-    echo "moved   $1 -> $1.pre-herdr-factory-$stamp"
+  if [ -L "$dst" ]; then
+    rm "$dst"
+  elif [ -e "$dst" ]; then
+    mkdir -p "$backup/$(dirname "$label")"
+    mv "$dst" "$backup/$label"
+    echo "moved   $label -> $backup/$label"
   fi
   ln -s "$src" "$dst"
-  echo "linked  $1"
+  echo "linked  $label"
 }
 
-for f in "$repo"/layouts/*; do link "layouts/$(basename "$f")"; done
-for d in "$repo"/mods/*/; do link "mods/$(basename "$d")"; done
+for f in "$repo"/layouts/*; do link "$f" "$home/layouts/$(basename "$f")" "layouts/$(basename "$f")"; done
+for d in "$repo"/mods/*/; do
+  name="$(basename "$d")"
+  link "$repo/mods/$name" "$home/mods/$name" "mods/$name"
+done
+link "$repo/mods/herdr-explorer/bin/herdr-explorer" "$bin/herdr-explorer" "bin/herdr-explorer"
 
 echo
 echo "Switch to it: herdr-app do layout.switch '{\"name\":\"herdr-factory\"}'  (or ctrl-shift-l)"

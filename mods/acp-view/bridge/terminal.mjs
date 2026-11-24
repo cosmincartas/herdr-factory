@@ -171,6 +171,12 @@ export class TerminalSide {
       case "permit_done":
         this.print(`  ${ev.optionId ? "✓ answered" : "✗ cancelled"}`);
         return;
+      case "question":
+        this.print(`  ? ${ev.message || "Claude has a question"} (answer it in the rich pane)`);
+        return;
+      case "question_done":
+        this.print(`  ${{ accept: "✓ answered", decline: "– skipped" }[ev.action] ?? "✗ cancelled"}`);
+        return;
       case "turn_end":
         this.print(`— turn ended (${ev.stopReason})`);
         return;

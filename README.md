@@ -1,7 +1,8 @@
 # herdr-factory
 
-A Herdr layout for running Claude Code agents, including ACP sessions that
-coordinate sub-agents with `hc`. It is Herdr's `main` layout plus:
+My Herdr setup: a layout for running Claude Code agents, including ACP sessions
+that coordinate sub-agents with `hc`, and the mods it uses. The layout is
+Herdr's `main` layout plus:
 
 - **Claude (ACP)** in the tab bar's + menu: a new tab holding only the rich
   ACP pane (`acp-view`). Its bridge runs in an hc terminal with no pane, so the
@@ -9,6 +10,10 @@ coordinate sub-agents with `hc`. It is Herdr's `main` layout plus:
   without a terminal pane next to it.
 - An agents list that shows those detached ACP sessions under their tab, with
   their sub-agents nested.
+- A keyboard-driven file explorer in the side panel's Files slot that opens
+  files in Helix (`herdr-explorer`), and Ctrl+click on terminal paths into Helix.
+- A start-point picker in the New worktree dialog (`factory-worktree`).
+- A tmux-style `Ctrl+B` prefix (`herdr-tui-prefix`).
 
 ## Contents
 
@@ -17,12 +22,15 @@ coordinate sub-agents with `hc`. It is Herdr's `main` layout plus:
 | `layouts/herdr-factory.json` | The window: sidebar (spaces, agents), tab bar, panes, Files/Changes panel, status bar |
 | `layouts/herdr-factory.svg` | Its preview in Herdr's settings |
 | `mods/factory-tabs/` | Clone of Herdr's `tabs`: + opens `factory-new-menu` |
-| `mods/factory-new-menu/` | Clone of `new-menu`: adds **Claude (ACP)**; taller New worktree dialog |
+| `mods/factory-new-menu/` | Clone of `new-menu`: adds **Claude (ACP)**; New and Open worktree open `factory-worktree` |
+| `mods/factory-worktree/` | Clone of `worktree`: New worktree picks the branch it starts from; see its README |
 | `mods/factory-agents/` | Clone of `agents`: lists detached ACP bridges (`acp-view.tab` label) |
 | `mods/acp-view/` | Claude Code over ACP, drawn natively; see its README |
+| `mods/herdr-explorer/` | File explorer and Ctrl+click handler that open files in Helix; see its README |
+| `mods/herdr-tui-prefix/` | `Ctrl+B` prefix popup, tmux-style; see its README |
 
-The three `factory-*` mods are clones of Herdr 0.1.16's shipped mods
-(`cloned_from` in each `mod.json`). Herdr never updates clones: after a Herdr
+The `factory-*` mods are clones of Herdr's shipped mods (`cloned_from` in
+each `mod.json` gives the version). Herdr never updates clones: after a Herdr
 update, compare them with `~/.config/herdr-app/mods/<name>/`.
 
 ## Install
@@ -32,7 +40,9 @@ update, compare them with `~/.config/herdr-app/mods/<name>/`.
 ```
 
 It links each layout file and mod folder into `~/.config/herdr-app`
-(`HERDR_APP_HOME` picks another), so Herdr runs the files in this repo.
+(`HERDR_APP_HOME` picks another), so Herdr runs the files in this repo, and
+`herdr-explorer`'s Helix helper into `~/.local/bin`. Anything it replaces
+that isn't a link is moved to `~/.config/herdr-app/.pre-herdr-factory/<time>/`.
 
 Herdr reloads a mod or layout when it sees a change in its own folder, and a
 change inside a symlinked folder doesn't reach it. While editing, keep this
@@ -45,7 +55,14 @@ running; it touches the link whenever a file under it changes:
 Without it, new panes and tabs load the new code but open ones don't;
 `touch -h ~/.config/herdr-app/mods/<name>` reloads one by hand.
 
-`acp-view` also needs:
+Some mods also need setup outside this repo:
+
+- `herdr-explorer`: Helix keys in `~/.config/helix/config.toml` (F12 to open,
+  `space e` to reveal) and optionally `alt-e` in `keys.json`; see its README.
+- `herdr-tui-prefix`: the `ctrl-b` bindings in `~/.config/herdr-app/keys.json`;
+  see its README.
+
+`acp-view` needs:
 
 - Node.js; the bridge runs `npm install` in `mods/acp-view/bridge` on its first start.
 - Its Claude Code `SessionStart` hook in `~/.claude/settings.json`, which marks
@@ -66,3 +83,6 @@ Without it, new panes and tabs load the new code but open ones don't;
   see detached ACP sessions (`acp-view` shows its own notifications).
 - `ctrl-shift-a` ACP panes still start a bridge with a terminal pane, as in
   Herdr's `main` layout.
+- New worktree from a space's right-click menu (Herdr's `menu` mod, opened by
+  `spaces`) still opens Herdr's `worktree`, without the start-point picker. Only
+  the tab bar's + menu opens `factory-worktree`.

@@ -39,7 +39,8 @@ it to focus that terminal). So the session works like a Claude terminal for hc:
 
 - It is in the Agents sidebar, with status from OSC 7501 reports
   (`app=claude-acp`): `working` during a turn, `blocked` (kind `permission`,
-  the tool's title as message) while a permission prompt is open, `idle` after
+  the tool's title as message) while a permission prompt is open, `blocked`
+  (kind `question`) while Claude waits on an answer, `idle` after
   a turn, `error` when a turn fails. Herdr plays the sounds and notifications.
 - Claude's tools inherit `HC_TERMINAL_ID`, so `hc run` from Claude starts
   sub-agents of this terminal, `hc wait --children` works, and the `shepherd`
@@ -50,7 +51,7 @@ it to focus that terminal). So the session works like a Claude terminal for hc:
   joined. The pane shows these turns like its own.
 - `hc interrupt t5m` (Esc) or Ctrl+C in the terminal stops the turn.
 - The terminal shows a plain-text log of the conversation, so `hc read t5m`
-  works. Permission prompts are answered in the pane only.
+  works. Permission prompts and questions are answered in the pane only.
 
 ## What it shows
 
@@ -70,6 +71,17 @@ it to focus that terminal). So the session works like a Claude terminal for hc:
   Click a picture to open it with `xdg-open`.
 - Tool calls as collapsible cards (diffs open by default, as unified patches),
   thoughts (collapsed), plans, permission requests as buttons, usage and cost.
+- Claude's questions (`AskUserQuestion`) as a form docked above the message
+  box, one question per tab (✓ once answered): options as rows (● one,
+  ☑ several, with their descriptions and previews), an **Other** box,
+  **Skip**, **Back**/**Next**, and **Submit** on the last tab. Keys while the
+  form has focus: 1–9 pick (a single choice moves on to the next tab), ←/→
+  switch tabs, Enter goes to the next tab or submits, Esc skips; Enter in a
+  text box does the same as Enter. The transcript keeps a card with the answers.
+  The bridge advertises ACP form elicitation (`elicitation: { form: {} }`),
+  which is what makes claude-agent-acp enable the tool; questions arrive as
+  `elicitation/create` and are parsed in `questions.js`. MCP servers' forms
+  (text, number, boolean, enum fields) use the same panel.
 - Mode chip (click cycles Manual → Accept edits → Plan → Auto → Bypass), Stop.
 - **Model** and **Effort** chips: click one for a menu of what the session
   offers (ACP `configOptions`, set with `session/set_config_option`). A model
@@ -78,6 +90,14 @@ it to focus that terminal). So the session works like a Claude terminal for hc:
   them again to each new session it starts: + New, a resumed session, or a
   restarted bridge. A pick the new session doesn't offer is skipped.
 - Drop PNG/JPEG/GIF/WebP files on the pane to attach them to the next message.
+- Type `/` for the session's slash commands (ACP `available_commands_update`:
+  Claude Code's built-ins, skills, plugin and MCP commands), with argument hints
+  and descriptions, filtered as you type the name (`slash.js`). ↑/↓ or
+  Ctrl+P/Ctrl+N move, Tab or a click puts the name in the composer, Enter runs
+  a command that takes no input (or whose whole name is typed) and completes
+  the others, Esc closes. The list is what the adapter offers: commands that
+  only work in Claude Code's terminal UI (`/clear`, `/resume`, `/status`, …)
+  aren't in it.
 
 ## The bridge and its lifetime
 

@@ -131,7 +131,7 @@
                       "id": "files",
                       "type": "block",
                       "content": {
-                        "mod": "files"
+                        "mod": "herdr-explorer"
                       }
                     },
                     {
@@ -184,5 +184,8 @@
     12,
     16
   ],
-  "preview": "layouts/herdr-factory.svg"
+  "preview": "layouts/herdr-factory.svg",
+  "link_handlers": [
+    "herdr-explorer"
+  ]
 }

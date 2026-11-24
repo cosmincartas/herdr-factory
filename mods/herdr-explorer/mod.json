@@ -1,0 +1,11 @@
+{
+  "place": "none",
+  "title": "Explorer",
+  "focusable": true,
+  "link_handlers": [
+    {
+      "kind": "file",
+      "pattern": "."
+    }
+  ]
+}

@@ -87,8 +87,11 @@ const term = HC_ID && process.stdin.isTTY && process.stdout.isTTY
 // Messages typed in while a turn runs (hc notes, reports): sent as the next turn.
 const queue = [];
 
+// Waiting on the person: a permission prompt or a question (form elicitation).
+const asking = () => permissions.size + questions.size;
+
 function typed(text) {
-  if (!sessionId || working || permissions.size) {
+  if (!sessionId || working || asking()) {
     queue.push(text);
     term?.show({ t: "queued", count: queue.length });
     return;
@@ -98,7 +101,7 @@ function typed(text) {
 
 // The next turn from the queue, if it's time for one.
 function drain() {
-  if (!sessionId || working || permissions.size || !queue.length) return false;
+  if (!sessionId || working || asking() || !queue.length) return false;
   prompt({ text: queue.splice(0).join("\n\n") });
   return true;
 }
@@ -109,6 +112,10 @@ function report() {
   if (permissions.size) {
     const title = [...permissionTitles.values()].at(-1);
     return term.status("blocked", { kind: "permission", msg: title ?? "Permission requested" });
+  }
+  if (questions.size) {
+    const title = [...questions.values()].at(-1).title;
+    return term.status("blocked", { kind: "question", msg: title ?? "Claude has a question" });
   }
   term.status(working ? "working" : "idle");
 }
@@ -149,6 +156,8 @@ let nextId = 0;
 const pending = new Map();
 const permissions = new Map();
 const permissionTitles = new Map();
+// Open form elicitations (AskUserQuestion, MCP forms): key -> { id, title }.
+const questions = new Map();
 
 function request(method, params) {
   const id = ++nextId;
@@ -193,6 +202,28 @@ async function onAgentMessage(m) {
       permissionTitles.set(String(m.id), m.params.toolCall?.title ?? null);
       report();
       emit({ t: "permission", id: String(m.id), toolCall: await transformToolCall(m.params.toolCall ?? {}), options: m.params.options ?? [] });
+      return;
+    }
+    // AskUserQuestion (and MCP server forms) as an ACP form elicitation. The
+    // view draws the form; its answer goes back as the response (see "answer").
+    case "elicitation/create": {
+      const p = m.params ?? {};
+      if (p.mode !== "form" || !p.requestedSchema) {
+        respond(m.id, { action: "decline" });
+        return;
+      }
+      questions.set(String(m.id), { id: m.id, title: p.message ?? null });
+      report();
+      emit({ t: "question", id: String(m.id), toolCallId: p.toolCallId ?? null, message: p.message ?? "", schema: p.requestedSchema });
+      return;
+    }
+    // The agent withdrew a request it sent (an elicitation whose turn ended).
+    case "$/cancel_request": {
+      const key = String(m.params?.requestId);
+      if (questions.delete(key)) {
+        emit({ t: "question_done", id: key, action: "cancel" });
+        report();
+      }
       return;
     }
     default:
@@ -257,7 +288,8 @@ async function start() {
   emit({ t: "status", text: "Starting Claude…" });
   const init = await request("initialize", {
     protocolVersion: 1,
-    clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+    // Form elicitation lets Claude ask (AskUserQuestion); without it the agent disables the tool.
+    clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false, elicitation: { form: {} } },
     clientInfo: { name: "herdr-acp-view", title: "Herdr ACP view", version: "0.1.0" },
   });
   let result = null;
@@ -322,7 +354,7 @@ async function prompt(msg) {
   }
 }
 
-// Stops the turn and turns down open permission prompts (Stop, Esc, Ctrl+C).
+// Stops the turn and turns down open permission prompts and questions (Stop, Esc, Ctrl+C).
 function cancel() {
   if (sessionId) notifyAgent("session/cancel", { sessionId });
   for (const [key, id] of permissions) {
@@ -330,6 +362,11 @@ function cancel() {
     permissions.delete(key);
     permissionTitles.delete(key);
     emit({ t: "permit_done", id: key, optionId: null });
+  }
+  for (const [key, q] of questions) {
+    respond(q.id, { action: "cancel" });
+    questions.delete(key);
+    emit({ t: "question_done", id: key, action: "cancel" });
   }
   report();
 }
@@ -345,6 +382,19 @@ async function onClientMessage(ws, msg) {
       permissionTitles.delete(String(msg.id));
       respond(id, { outcome: msg.optionId ? { outcome: "selected", optionId: msg.optionId } : { outcome: "cancelled" } });
       emit({ t: "permit_done", id: String(msg.id), optionId: msg.optionId ?? null });
+      report();
+      return;
+    }
+    // An answer to a question: accept with the form's content, decline (Skip) or cancel.
+    case "answer": {
+      const key = String(msg.id);
+      const q = questions.get(key);
+      if (!q) return;
+      questions.delete(key);
+      const action = ["accept", "decline", "cancel"].includes(msg.action) ? msg.action : "cancel";
+      const content = action === "accept" && msg.content && typeof msg.content === "object" ? msg.content : undefined;
+      respond(q.id, action === "accept" ? { action, content: content ?? {} } : { action });
+      emit({ t: "question_done", id: key, action, ...(content ? { content } : {}) });
       report();
       return;
     }
@@ -394,7 +444,7 @@ const armIdle = () => {
   if (clients.size === 0) idleTimer = setTimeout(async () => {
     // Never walk away from a running turn, an unanswered permission prompt,
     // or subagents (hc ends a terminal's children with it).
-    if (working || permissions.size || queue.length || (await liveChildren())) return armIdle();
+    if (working || asking() || queue.length || (await liveChildren())) return armIdle();
     if (clients.size) return;
     log("no view for", IDLE_MS, "ms; exiting");
     shutdown(0);
@@ -433,7 +483,7 @@ wss.on("connection", (ws, req) => {
       // timer, which waits for it (a pane hidden or closed mid-turn).
       closeTimer = setTimeout(async () => {
         if (clients.size) return;
-        if (working || permissions.size || queue.length) { log("view gone mid-turn; waiting for it"); return armIdle(); }
+        if (working || asking() || queue.length) { log("view gone mid-turn; waiting for it"); return armIdle(); }
         // App quit or a reload also closes the view: keep subagents alive.
         const kids = await liveChildren();
         if (kids) { log("view gone with", kids, "live subagents; waiting for them"); return armIdle(); }

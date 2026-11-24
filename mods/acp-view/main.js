@@ -1,5 +1,7 @@
 // Claude Code over ACP in a pane of its own: Markdown, Mermaid diagrams and
-// images rendered natively, tool calls as cards, permission prompts as buttons.
+// images rendered natively, tool calls as cards, permission prompts as buttons,
+// Claude's questions (AskUserQuestion, as ACP form elicitations) as a form
+// docked above the composer.
 //
 // The pane isn't tied to a terminal. It owns one session at a time, in its
 // folder: a new one, or any earlier Claude Code session there (Sessions).
@@ -29,7 +31,14 @@ import { Link } from "./link.js";
 import { Store } from "./store.js";
 import { Transcript } from "./transcript.js";
 import { segments, hashKey } from "./segments.js";
+import { slashMatches, completion } from "./slash.js";
+import { initialPicks, pick, formContent, missing, answerLines } from "./questions.js";
 
+const SLASH_KEYS = [
+  ["up", "acp_slash_up"], ["ctrl-p", "acp_slash_up"],
+  ["down", "acp_slash_down"], ["ctrl-n", "acp_slash_down"],
+  ["tab", "acp_slash_complete"], ["escape", "acp_slash_close"],
+];
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const KIND = { read: "≡", edit: "✎", delete: "⌫", move: "⇄", search: "⌕", execute: "❯", think: "◌", fetch: "⇣", switch_mode: "⇆", other: "◇" };
 const MAX_TOOL_TEXT = 6000;
@@ -56,6 +65,13 @@ export default class AcpView extends View {
     this.menu = null;
     this.scroll = ScrollHandle.new();
     this.focus = cx.focus_handle();
+    // The `/` panel: the highlighted command, and the text Esc closed it on.
+    this.slashIndex = 0;
+    this.slashClosed = null;
+    this.slashScroll = ScrollHandle.new();
+    // The open question's answers in progress: { id, picks, inputs, active, error }.
+    this.ask = null;
+    this.askFocus = cx.focus_handle();
 
     const st = this.store;
     this.cwd = st.get("cwd") ?? p.cwd ?? home();
@@ -66,8 +82,24 @@ export default class AcpView extends View {
     this.input.set_auto_grow(1, 10);
     this.input.on("submit", (e, cx) => {
       if (e?.shift) return;
-      this.submit(cx);
+      const list = this.slashList();
+      if (list?.length) this.chooseSlash(list[Math.min(this.slashIndex, list.length - 1)], true, cx);
+      else this.submit(cx);
     });
+    this.input.on("change", (_e, cx) => {
+      this.slashIndex = 0;
+      if (this.input.value() !== this.slashClosed) this.slashClosed = null;
+      cx.notify();
+    });
+    // The `/` panel's keys. "AcpSlash > Input" matches at the textarea itself,
+    // as deep as its own bindings, and a later binding wins a tie. Each context
+    // is bound on its own: a list is all-or-nothing, so one predicate the app
+    // can't parse must not take the other down with it.
+    for (const context of ["AcpSlash > Input", "AcpSlash"]) {
+      try {
+        cx.bind_keys(SLASH_KEYS.map(([keystroke, action]) => ({ keystroke, action, context })));
+      } catch {}
+    }
 
     if (checking()) return;
     if (!this.tab && p.adoptTab) this.adoptTab(cx);
@@ -165,6 +197,7 @@ export default class AcpView extends View {
     }
     this.busy = true;
     this.picker = null;
+    this.syncAsk(null);
     cx.notify();
     cx.spawn(async (cx) => {
       await this.link?.shutdown();
@@ -237,6 +270,7 @@ export default class AcpView extends View {
         // Only a session with a prompt in it has a transcript to load later.
         if (msg.t === "user" && this.transcript.session?.sessionId) this.store.set("session", this.transcript.session.sessionId);
     }
+    this.syncAsk(this.transcript.pendingQuestion);
     if (this.follow) this.scrollToEnd();
   }
 
@@ -251,9 +285,10 @@ export default class AcpView extends View {
     if (focused()?.tab === this.tab) return;
     if (this.terminal && agents().some((a) => a.address === this.terminal)) return;
     const title = this.transcript.title ?? "Claude (ACP)";
-    if (msg.t === "permission") {
+    if (msg.t === "permission" || msg.t === "question") {
       playSound("blocked");
-      notify({ title: `${title} needs you`, body: msg.toolCall?.title ?? "Permission requested", level: "warning", action: this.tab ? { name: "tab.select", args: { id: this.tab } } : undefined });
+      const body = msg.t === "question" ? msg.message || "Claude has a question" : msg.toolCall?.title ?? "Permission requested";
+      notify({ title: `${title} needs you`, body, level: "warning", action: this.tab ? { name: "tab.select", args: { id: this.tab } } : undefined });
     } else if (msg.t === "turn_end") {
       playSound("done");
       notify({ title: `${title} finished`, body: shortPath(this.cwd, home()), level: "success", action: this.tab ? { name: "tab.select", args: { id: this.tab } } : undefined });
@@ -277,8 +312,149 @@ export default class AcpView extends View {
     this.link?.send({ t: "cancel" });
   }
 
+  // The commands the `/` panel offers for the composer's text, or null when it's closed.
+  slashList() {
+    const text = this.input.value();
+    if (text === this.slashClosed) return null;
+    return slashMatches(this.transcript.commands, text);
+  }
+
+  // Enter (run) sends a command that takes no input, or one whose whole name
+  // is typed already; otherwise, and on Tab or a click, the name goes in the
+  // composer for its arguments to follow.
+  chooseSlash(c, run, cx) {
+    if (run && (!c.input || this.input.value() === `/${c.name}`)) {
+      this.input.set_value(`/${c.name}`);
+      this.submit(cx);
+      return;
+    }
+    const text = completion(c);
+    this.input.set_value(text);
+    this.input.set_selected_range({ start: text.length, end: text.length });
+    this.input.focus();
+    cx.notify();
+  }
+
+  // ↑/↓ (or Ctrl+P/Ctrl+N) move the highlight, Tab completes, Esc closes.
+  // These come in as actions (SLASH_KEYS), not key events: the textarea's own
+  // bindings (move the cursor, indent, unselect) run before any on_key_down
+  // above it, so a key handler on the composer never sees these keys.
+  slashAction(what, cx) {
+    const list = this.slashList();
+    if (!list?.length) return;
+    const sel = Math.min(this.slashIndex, list.length - 1);
+    if (what === "complete") this.chooseSlash(list[sel], false, cx);
+    else if (what === "close") this.slashClosed = this.input.value();
+    else {
+      this.slashIndex = (sel + (what === "down" ? 1 : -1) + list.length) % list.length;
+      this.slashScroll.scroll_to_item(this.slashIndex);
+    }
+    cx.notify();
+  }
+
   permit(id, optionId) {
     this.link?.send({ t: "permit", id, optionId });
+  }
+
+  // --- questions (form elicitations) -----------------------------------------------
+
+  // Keeps this.ask on the question that is open (q, or null): a new one gets
+  // fresh picks and text boxes and the keyboard; an answered one lets them go.
+  syncAsk(q) {
+    if (this.ask && this.ask.id === q?.id) return;
+    const hadOne = Boolean(this.ask);
+    for (const s of this.ask?.inputs.values() ?? []) s.release();
+    this.ask = null;
+    if (!q) {
+      if (hadOne) this.input.focus();
+      return;
+    }
+    const inputs = new Map();
+    const box = (key, placeholder) => {
+      const s = TextareaState.new({ placeholder });
+      s.set_auto_grow(1, 4);
+      s.on("submit", (e, cx) => { if (!e?.shift) this.askEnter(cx); });
+      inputs.set(key, s);
+    };
+    for (const f of q.fields) {
+      if (f.kind === "text" || f.kind === "number" || f.kind === "integer") box(f.key, f.description ?? (f.kind === "text" ? "Type your answer" : "A number"));
+      if (f.other) box(f.other.key, f.other.description ?? "Type your own answer (optional)");
+    }
+    this.ask = { id: q.id, picks: initialPicks(q.fields), inputs, active: 0, error: null };
+    this.askFocus.focus();
+  }
+
+  answerAsk(action, cx) {
+    const q = this.transcript.pendingQuestion;
+    const a = this.ask;
+    if (!q || !a || a.id !== q.id) return;
+    if (action === "accept") {
+      const texts = {};
+      for (const [k, s] of a.inputs) texts[k] = s.value();
+      const content = formContent(q.fields, a.picks, texts);
+      const miss = missing(q.fields, content);
+      if (miss.length) {
+        a.error = `Still needs an answer: ${miss.join(", ")}`;
+        const first = q.fields.findIndex((f) => miss.includes(f.title ?? f.key));
+        if (first >= 0) a.active = first;
+        cx.notify();
+        return;
+      }
+      this.link?.send({ t: "answer", id: q.id, action, content });
+    } else this.link?.send({ t: "answer", id: q.id, action });
+    cx.notify();
+  }
+
+  // One question per tab. Switching tabs gives the keyboard back to the form.
+  askTab(i, cx) {
+    const q = this.transcript.pendingQuestion;
+    if (!this.ask || !q) return;
+    this.ask.active = Math.max(0, Math.min(i, q.fields.length - 1));
+    this.askFocus.focus();
+    cx.notify();
+  }
+
+  // Enter: the next question's tab, or Submit on the last one.
+  askEnter(cx) {
+    const q = this.transcript.pendingQuestion;
+    const a = this.ask;
+    if (!q || !a) return;
+    if (a.active < q.fields.length - 1) return this.askTab(a.active + 1, cx);
+    this.answerAsk("accept", cx);
+  }
+
+  // Whether a question has an answer yet (a ✓ on its tab).
+  askAnswered(f) {
+    const a = this.ask;
+    const v = a.picks[f.key];
+    const typed = (key) => Boolean(a.inputs.get(key)?.value().trim());
+    if (f.other && typed(f.other.key)) return true;
+    if (f.kind === "multi") return Boolean(v?.length);
+    if (f.kind === "single") return v !== undefined && v !== null;
+    if (f.kind === "boolean") return true;
+    return typed(f.key);
+  }
+
+  // Keys while the form itself (not one of its text boxes) has the keyboard:
+  // 1–9 pick in the shown question (one choice moves on to the next tab),
+  // ←/→ switch tabs, Enter goes to the next tab or submits, Esc skips.
+  askKey(e, q, cx) {
+    const a = this.ask;
+    if (!a || !this.askFocus.is_focused()) return;
+    const k = e.keystroke;
+    const f = q.fields[a.active];
+    if (/^[1-9]$/.test(k) && f?.options.length) {
+      const o = f.options[Number(k) - 1];
+      if (!o) return;
+      pick(a.picks, f, o.value);
+      a.error = null;
+      if (f.kind === "single" && a.picks[f.key] !== undefined && a.active < q.fields.length - 1) return this.askTab(a.active + 1, cx);
+    } else if (k === "right" || k === "l") return this.askTab(a.active + 1, cx);
+    else if (k === "left" || k === "h") return this.askTab(a.active - 1, cx);
+    else if (k === "enter") return this.askEnter(cx);
+    else if (k === "escape") return this.answerAsk("decline", cx);
+    else return;
+    cx.notify();
   }
 
   cycleMode() {
@@ -440,6 +616,7 @@ export default class AcpView extends View {
       case "thought": return this.thought(it, i, t);
       case "tool": return this.tool(it, i, t);
       case "permission": return this.permission(it, i, t);
+      case "question": return this.question(it, i, t);
       case "plan": return this.plan(it, i, t);
       case "notice": return div().id(`n-${i}`).text_size(12).text_color(t.dim).child(it.text);
       case "error": return div().id(`e-${i}`).px(10).py(6).rounded(6).bg(t.raised).text_size(12).text_color(t.blocked).child(it.text);
@@ -596,6 +773,95 @@ export default class AcpView extends View {
       }))));
   }
 
+  // The transcript's record of a question: where to answer it, then what was answered.
+  question(it, i, t) {
+    const answered = it.answer !== undefined;
+    const card = v_flex().id(`q-${i}`).w_full().p(12).gap(6).rounded(8).border_1().border_color(answered ? t.border : t.blocked).bg(t.surface)
+      .child(h_flex().gap(8).text_size(12.5).items_center()
+        .child(div().text_color(answered ? t.accent : t.blocked).font_semibold().child("?"))
+        .child(div().font_semibold().child(answered ? "Claude asked" : "Claude asks"))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(it.fields.length > 1 ? `${it.fields.length} questions` : it.message)));
+    if (!answered) return card.child(div().text_size(12).text_color(t.dim).child("Answer it below, above the message box."));
+    return card.children(answerLines(it.fields, it.answer).map((l, j) => h_flex().id(`qa-${i}-${j}`).gap(8).text_size(12)
+      .when(Boolean(l.title), (el) => el.child(div().flex_shrink_0().max_w(320).truncate().text_color(t.dim).child(l.title)))
+      .child(div().flex_1().min_w(0).text_color(it.answer.action === "accept" ? t.foreground : t.dim).child(l.text))));
+  }
+
+  // The open question, docked above the composer like a popover. Several
+  // questions get one tab each (✓ once answered); the shown one has its
+  // options as rows (● one, ☑ several), an "Other" box, then Skip and
+  // Back/Next or Submit.
+  askPanel(q, t) {
+    const a = this.ask;
+    const n = q.fields.length;
+    const several = n > 1;
+    const last = a.active >= n - 1;
+    const f = q.fields[a.active];
+    return v_flex().id(`ask-${q.id}`).track_focus(this.askFocus).on_key_down((e, cx) => this.askKey(e, q, cx))
+      .max_h(Math.max(240, Math.round((this.size?.height ?? 640) * 0.6))).overflow_y_scrollbar()
+      .p(12).gap(10).rounded(8).border_1().border_color(t.blocked).bg(t.popover ?? t.raised).shadow_md().text_size(12.5)
+      .child(h_flex().gap(8).items_center()
+        .child(div().text_color(t.blocked).font_semibold().child("?"))
+        .child(div().font_semibold().child(several ? `Claude has ${n} questions` : "Claude asks"))
+        .when(several, (el) => el.child(div().text_size(11).text_color(t.dim).child(`${a.active + 1} of ${n}`))))
+      .when(several, (el) => el.child(h_flex().id("ask-tabs").gap(2).flex_wrap().border_b_1().border_color(t.border)
+        .children(q.fields.map((g, j) => {
+          const on = j === a.active;
+          const done = this.askAnswered(g);
+          return h_flex().id(`askt-${j}`).px(10).py(5).gap(6).items_center().cursor_pointer()
+            .border_b_2().border_color(on ? t.accent : t.popover ?? t.raised)
+            .text_color(on ? t.foreground : t.muted).hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => this.askTab(j, cx))
+            .child(div().text_color(done ? t.done : t.dim).child(done ? "✓" : String(j + 1)))
+            .child(div().max_w(160).truncate().when(on, (el) => el.font_semibold()).child(g.title ?? `Question ${j + 1}`));
+        }))))
+      .when(Boolean(q.message) && !several, (el) => el.child(md(`askm-${q.id}`, q.message)))
+      .child(this.askField(q, f, a.active, t))
+      .when(Boolean(a.error), (el) => el.child(div().text_size(12).text_color(t.blocked).child(a.error)))
+      .child(h_flex().gap(8).items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim)
+          .child(several ? "1–9 pick · ←→ question · Enter next · Esc skip" : "1–9 pick · Enter submit · Esc skip"))
+        .child(button("ask-skip", "Skip", t, false, (_e, cx) => this.answerAsk("decline", cx)))
+        .when(several && a.active > 0, (el) => el.child(button("ask-back", "Back", t, false, (_e, cx) => this.askTab(a.active - 1, cx))))
+        .child(last
+          ? button("ask-submit", "Submit", t, true, (_e, cx) => this.answerAsk("accept", cx))
+          : button("ask-next", "Next", t, true, (_e, cx) => this.askTab(a.active + 1, cx))));
+  }
+
+  // One question: its header and text, then options, preview and text boxes.
+  askField(q, f, j, t) {
+    const a = this.ask;
+    const several = q.fields.length > 1;
+    const v = a.picks[f.key];
+    const on = (o) => (f.kind === "multi" ? (v ?? []).includes(o.value) : v === o.value);
+    const choose = (fn) => (_e, cx) => { a.error = null; fn(); this.askFocus.focus(); cx.notify(); };
+    const picked = f.options.filter(on);
+    const preview = picked.find((o) => o.preview)?.preview;
+    const textBox = (key) => div().id(`askx-${j}-${key}`).w_full().rounded(6).border_1().border_color(t.input).bg(t.background).px(8).py(4)
+      .child(Textarea.new(a.inputs.get(key)).w_full().text_size(12.5).text_color(t.foreground));
+    const question = several ? f.description : !f.options.length && f.kind !== "boolean" ? f.description : null;
+    return v_flex().id(`askf-${q.id}-${j}`).gap(6)
+      .when(Boolean(f.title) && !several, (el) => el.child(h_flex().child(div().px(6).py(1).rounded(4).bg(t.raised).text_size(11).text_color(t.muted).child(f.title + (f.required ? " *" : "")))))
+      .when(Boolean(question), (el) => el.child(div().font_medium().child(question + (several && f.required ? " *" : ""))))
+      .when(f.kind === "multi", (el) => el.child(div().text_size(11).text_color(t.dim).child("Pick any that apply.")))
+      .children(f.options.map((o, k) => h_flex().id(`asko-${j}-${k}`).px(8).py(5).gap(8).rounded(6).items_start().cursor_pointer()
+        .when(on(o), (el) => el.bg(t.selected))
+        .hover((s) => s.bg(t.hover))
+        .on_click(choose(() => pick(a.picks, f, o.value)))
+        .child(div().w(14).flex_shrink_0().text_color(on(o) ? t.accent : t.dim).child(f.kind === "multi" ? (on(o) ? "☑" : "☐") : on(o) ? "●" : "○"))
+        .child(v_flex().flex_1().min_w(0).gap(1)
+          .child(div().text_color(on(o) ? t.accent : t.foreground).child(o.label))
+          .when(Boolean(o.description), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(o.description))))
+        .when(k < 9, (el) => el.child(div().flex_shrink_0().text_size(11).text_color(t.dim).child(String(k + 1))))))
+      .when(Boolean(preview), (el) => el.child(div().pl(22).child(md(`askp-${j}`, preview))))
+      .when(f.kind === "boolean", (el) => el.child(h_flex().id(`askb-${j}`).px(8).py(5).gap(8).rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click(choose(() => pick(a.picks, f, null)))
+        .child(div().w(14).text_color(v ? t.accent : t.dim).child(v ? "☑" : "☐"))
+        .child(div().child(f.description ?? f.title ?? "Yes"))))
+      .when(a.inputs.has(f.key), (el) => el.child(textBox(f.key)))
+      .when(Boolean(f.other), (el) => el.child(textBox(f.other.key)));
+  }
+
   plan(it, i, t) {
     const mark = { completed: "☑", in_progress: "◐", pending: "☐" };
     return v_flex().id(`pl-${i}`).w_full().p(10).gap(4).rounded(8).border_1().border_color(t.border).bg(t.surface).text_size(12.5)
@@ -608,6 +874,8 @@ export default class AcpView extends View {
   composer(t) {
     const live = this.link?.state === "live" && !this.transcript.exited;
     const pendingPerm = this.transcript.pendingPermission;
+    const pendingQ = this.ask ? this.transcript.pendingQuestion : null;
+    const slash = this.slashList();
     return v_flex().px(14).pt(8).pb(12).gap(6).border_t_1().border_color(t.border).bg(t.chrome)
       .when(this.attachments.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().children(this.attachments.map((p, j) =>
         h_flex().id(`att-${j}`).gap(6).px(8).py(2).rounded(6).bg(t.raised).text_size(11.5).items_center()
@@ -615,12 +883,37 @@ export default class AcpView extends View {
           .child(div().id(`attx-${j}`).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => { this.attachments.splice(j, 1); cx.notify(); }).child("✕"))))))
       .when(Boolean(pendingPerm), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child("Claude is waiting for a permission answer above.")))
+      .when(Boolean(pendingQ), (el) => el.child(this.askPanel(pendingQ, t)))
+      .when(Boolean(slash?.length), (el) => el.child(this.slashPanel(slash, t)))
       .child(h_flex().gap(8).items_end()
-        .child(div().flex_1().min_w(0).rounded(8).border_1().border_color(t.input).bg(t.background).px(10).py(6)
+        .child(div().id("composer-box")
+          // Only while the panel is open, so ↑/↓/Tab/Esc are the textarea's otherwise.
+          .when(Boolean(slash?.length), (el) => el.key_context("AcpSlash"))
+          .on_action("acp_slash_up", (_e, cx) => this.slashAction("up", cx))
+          .on_action("acp_slash_down", (_e, cx) => this.slashAction("down", cx))
+          .on_action("acp_slash_complete", (_e, cx) => this.slashAction("complete", cx))
+          .on_action("acp_slash_close", (_e, cx) => this.slashAction("close", cx))
+          .flex_1().min_w(0).rounded(8).border_1().border_color(t.input).bg(t.background).px(10).py(6)
           .child(Textarea.new(this.input).w_full().text_size(13.5).text_color(t.foreground)))
         .child(this.working
           ? button("stop", "Stop", t, false, () => this.cancel())
           : button("send", "Send", t, true, (_e, cx) => this.submit(cx), !live)));
+  }
+
+  // The session's slash commands that fit what is typed, above the composer.
+  slashPanel(list, t) {
+    const sel = Math.min(this.slashIndex, list.length - 1);
+    return v_flex().gap(4)
+      .child(v_flex().id("slash").max_h(264).overflow_y_scrollbar().track_scroll(this.slashScroll)
+        .p(4).rounded(8).border_1().border_color(t.border).bg(t.popover ?? t.raised).text_size(12.5)
+        .children(list.map((c, i) => h_flex().id(`slash-${c.name}`).gap(10).px(8).py(4).rounded(5).items_center().cursor_pointer()
+          .when(i === sel, (el) => el.bg(t.selected))
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.chooseSlash(c, false, cx))
+          .child(div().flex_shrink_0().text_color(i === sel ? t.accent : t.foreground).child(`/${c.name}`))
+          .when(Boolean(c.input?.hint), (el) => el.child(div().flex_shrink_0().max_w(200).truncate().text_color(t.dim).child(c.input.hint)))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(c.description ?? "")))))
+      .child(div().px(4).text_size(11).text_color(t.dim).child("↑↓ choose · Tab complete · Enter run · Esc close"));
   }
 
   maxWidth() {
