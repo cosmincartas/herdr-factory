@@ -5,6 +5,10 @@
 // leaves the path in a per-terminal file and presses one key that Helix binds to
 //   F12 = ":open %sh{herdr-explorer take}"
 // `herdr-explorer take` prints that file and deletes it (see bin/herdr-explorer).
+//
+// herdr-core holds `hc keys` until about 3 s after a person last typed or clicked in that
+// terminal, so a press can wait seconds after you touch Helix. Opens made meanwhile don't press
+// again: they replace the queued path, and the press already waiting opens the newest file, once.
 import { panes, focused, exec, hc, run, readTextFile, writeTextFile } from "herdr";
 
 /** Program keys Herdr gives Helix panes (evil-helix's binary is also `hx`). */
@@ -23,6 +27,10 @@ const QUEUE = 'd="${XDG_RUNTIME_DIR:-/tmp}/herdr-explorer"; mkdir -p "$d" && pri
 
 /** localStorage key: the paired and last focused Helix per tab, shared with link.js (Ctrl+clicks). */
 const STORE = "router";
+
+/** terminal -> its hand-over still being pressed. Module-wide, so every Router (link.js makes its
+ *  own) sees it. Local editors only: a remote queue file isn't read back. */
+const sending = new Map();
 
 const machineOf = address => (address?.includes("/") ? address.split("/")[0] : null);
 const idOf = address => address.split("/").pop();
@@ -95,12 +103,37 @@ export class Router {
     if (focus) run("pane.focus", { terminal: p.terminal });
     const queued = await this.queue(idOf(p.terminal), path, on);
     if (on || !sleep) await this.press(p.terminal, ["esc", OPEN_KEY]);
-    else {
-      await this.press(p.terminal, [OPEN_KEY]);
-      if (!(await this.taken(queued, FALLBACK_AFTER, sleep))) await this.press(p.terminal, ["esc", OPEN_KEY]);
+    else for (;;) {
+      const busy = sending.get(p.terminal);
+      if (!busy) {
+        const send = this.deliver(p.terminal, queued, sleep);
+        sending.set(p.terminal, send);
+        try { await send; } finally { if (sending.get(p.terminal) === send) sending.delete(p.terminal); }
+        break;
+      }
+      // That press opens this path. Should it end with the path still queued (written just
+      // after it last looked), the next round presses again.
+      await busy.catch(() => {});
+      if ((await readTextFile(queued).catch(() => null)) === null) break;
     }
     this.remember("paired", p.tab, p.terminal);
     return { terminal: p.terminal, queued, on };
+  }
+
+  /** Presses OPEN_KEY until Helix has taken `queued`: Esc then OPEN_KEY if it hasn't within
+   *  FALLBACK_AFTER, and once more if a newer path landed after Helix took the last one (an open
+   *  that came while this press was held, but just after Helix ran `take`). Resolves once Helix
+   *  has taken the path or the fallback has had FALLBACK_AFTER to work. */
+  async deliver(terminal, queued, sleep) {
+    for (let round = 0; round < 2; round++) {
+      await this.press(terminal, [OPEN_KEY]);
+      if (!(await this.taken(queued, FALLBACK_AFTER, sleep))) {
+        await this.press(terminal, ["esc", OPEN_KEY]);
+        await this.taken(queued, FALLBACK_AFTER, sleep);  // so an open waiting on this doesn't press too
+        return;
+      }
+      if ((await readTextFile(queued).catch(() => null)) === null) return;
+    }
   }
 
   /** Leaves `path` where `herdr-explorer take` finds it; resolves with that file. Here it's
