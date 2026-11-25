@@ -5,10 +5,10 @@
 // Files open in the paired Helix pane (see router.js); Helix can ask the explorer to
 // reveal its current file with `herdr-explorer reveal` (see bin/herdr-explorer).
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, ScrollHandle, InputState, Input, Popover } from "gpui-base";
+import { v_flex, h_flex, v_virtual_list, Scrollbar, VirtualListScrollHandle, InputState, Input, Popover } from "gpui-base";
 import { spaces, panes, focused, theme, nextCommand, notify, checking, exec, readTextFile, watchFolder } from "herdr";
 import { listFolder, gitTop, gitMarks, TOTAL } from "./listing.js";
-import { listFiles, findFiles, searchContent, MAX_FILE_RESULTS, MAX_MATCHES } from "./search.js";
+import { listFiles, findFiles, searchContent, columnOf, MAX_FILE_RESULTS, MAX_MATCHES } from "./search.js";
 import { Router } from "./router.js";
 
 const ICON = name => `mods/herdr-explorer/${name}.svg`;
@@ -22,20 +22,60 @@ const alpha = (c, a) => (/^#[0-9a-f]{6}$/i.test(c) ? c + Math.round(a * 255).toS
 const CLEAR = "#00000000";
 /** How long Helix gets to take a queued file before the explorer says the binding is missing. */
 const TAKE_TIMEOUT = 5000;
+/** A Find files / Search request older than this (bin/herdr-explorer) is a leftover, not a wish. */
+const PENDING_MAX_AGE = 5000;
+/** localStorage key: the request this mod already applied, so a fresh copy does not apply it again. */
+const HANDLED_COMMAND = "herdr-explorer.command.handled";
 /** Content search waits this long after the last keystroke. */
 const SEARCH_DEBOUNCE = 200;
 /** Tree and Find files rows are this tall, inside this much padding: how `gw` knows which rows are on screen. */
 const ROW_H = 24, LIST_PAD = 8;
+/** A search result's two fixed heights (Task 4's spike): a file row is 6 px above a 22 px row, a
+ *  match row is an 18 px row with 1 px of padding each side. */
+const RESULT_FILE_H = 28, RESULT_MATCH_H = 20;
 /** `gw` labels, like Helix's jump-label-alphabet: one letter while the rows fit, else two. */
 const JUMP_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
 const jumpLabels = n => n <= JUMP_ALPHABET.length ? [...JUMP_ALPHABET].slice(0, n)
   : [...JUMP_ALPHABET].flatMap(a => [...JUMP_ALPHABET].map(b => a + b)).slice(0, n);
+/** How many folders one refresh lists at once (remote spaces list slower). */
+const LIST_PARALLEL = 8;
+
+/** The absolute path of folder `rel` under `root` ("" is the root itself), without a doubled slash. */
+const folderAt = (root, rel) => (!rel ? root : root === "/" ? `/${rel}` : `${root}/${rel}`);
+/** The folder holding `path`; unlike parentOf, "/top.js" sits in "/" and not in "". */
+const dirOf = path => { const at = path.lastIndexOf("/"); return at > 0 ? path.slice(0, at) : at === 0 ? "/" : ""; };
+
+/** Lists these folders (relative to `root`, "" for the root) at most LIST_PARALLEL at a time.
+ *  Resolves with { entries: Map rel -> entries, failed: [rel], error }; the root's failure rejects
+ *  and `error` stays null, and only once every listing already started has settled, so no two
+ *  passes list at the same time. `partial` resolves anyway, with the root's failure in `error`, and
+ *  keeps listing the folders still queued, so the folders that did list are not lost.
+ *  `stop()` ends the pool after the listings in flight: a root switch has nothing left to list.
+ *  `gone(rel, error)` hears each child folder whose listing failed, as soon as it fails. */
+async function listFolders(root, on, rels, stop = () => false, gone = () => {}, partial = false) {
+  const entries = new Map(), failed = [];
+  let at = 0, halted = false, error = null;
+  const worker = async () => {
+    while (!halted && at < rels.length && !stop()) {
+      const rel = rels[at++];
+      try { entries.set(rel, await listFolder(rel ? folderAt(root, rel) : root, on)); }
+      catch (e) { if (rel) { failed.push(rel); gone(rel, e); } else { halted = !partial; error = e; } }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(LIST_PARALLEL, rels.length) }, worker));
+  if (error && !partial) throw error;
+  return { entries, failed, error };
+}
 
 export default class Explorer extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
-    this.scroll = ScrollHandle.new();   // the tree
-    this.rscroll = ScrollHandle.new();  // find and search results
+    this.scroll = VirtualListScrollHandle.new();   // the tree
+    this.fscroll = VirtualListScrollHandle.new();  // Find files
+    this.rscroll = VirtualListScrollHandle.new();  // search results
+    this._rows = null;                 // rows() built once per state change (P6)
+    this._resultRows = null; this._resultSizes = null;  // resultRows() likewise
+    this.resultsRev = 0;               // bumped when the result set is replaced (T6-01)
     this.router = new Router();
     this.root = null; this.on = null; this.gen = 0;
     this.seen = null;          // the focused terminal folder the root was last picked from
@@ -45,9 +85,13 @@ export default class Explorer extends View {
     this.cursor = null; this.showHidden = true;
     this.pending = null;       // "g" after a g, waiting for gg / ge / gw (Helix's goto mode)
     this.jump = null;          // gw labels on screen: { list, at: label -> row index, byIndex, typed }
-    this.error = null; this.loading = false; this.again = false;
+    this.error = null; this.loading = false; this.again = false; this.againChanged = undefined;
     this.memory = new Map();   // root -> { open, cursor }: each project keeps its folds
-    this.runtime = null; this.lastReveal = null;
+    this.tops = new Map();     // root -> its git checkout: one rev-parse per root, not per refresh
+    this.runtime = null; this.lastReveal = null; this.readingCommand = false; this.commandAgain = false;
+    // localStorage outlives a reload or another copy of this mod: a request already applied must not
+    // reopen the panel when init runs again.
+    this.lastCommand = localStorage.getItem(HANDLED_COMMAND) ?? null;
 
     this.view = "tree";        // "tree" (with Find files over it) or "search"
     this.typing = null;        // the input with the keyboard: "find" | "search" | "include" | "exclude"
@@ -57,6 +101,7 @@ export default class Explorer extends View {
     this.menuOpen = false;
     this.opts = { caseSensitive: false, wholeWord: false, regex: false, details: false };
     this.results = null; this.searching = false; this.searchError = null; this.ssel = 0; this.collapsed = new Set(); this.seq = 0;
+    this.searchTimer = null; this.searchAgain = false;  // one rg at a time: the latest query waits here
 
     this.findInput = this.input("find", "Find files", cx => {
       this.findQuery = this.findInput.value();
@@ -86,17 +131,23 @@ export default class Explorer extends View {
   }
 
   // keys.json: "alt-e": "herdr-explorer.toggle-focus" (also "focus", "find-files", "search", "reveal").
-  // "find-files:<text>" and "search:<text>" start with that text (bin/herdr-explorer find|search TEXT).
+  // "find-files:<text>" and "search:<text>" start with that text (bin/herdr-explorer find|search TEXT,
+  // which leaves the request for "pending" to apply).
   command(c, cx) {
-    this.pending = this.jump = null;
     const at = c.indexOf(":"), name = at < 0 ? c : c.slice(0, at), text = at < 0 ? null : c.slice(at + 1);
+    // An internal wake only looks for a request: clearing the g / gw prefix here would cancel the
+    // key the user pressed just before it. Only Find files and Search (which a request re-enters
+    // through) clear it.
+    if (name === "pending") { cx.spawn(async cx => this.pendingCommand(cx)); return; }
     if (name === "focus") this.handle.focus();
     else if (name === "toggle-focus") { if (!(this.handle.is_focused() || this.typing) || !this.router.focusEditor()) this.handle.focus(); }
     else if (name === "find-files") {
+      this.pending = this.jump = null;
       this.startFind(cx);
       if (text !== null) { this.findInput.set_value(text); this.findQuery = text; this.filterFiles(); }
     } else if (name === "search") {
-      if (text !== null) { this.searchInput.set_value(text); this.results = null; }
+      this.pending = this.jump = null;
+      if (text !== null) { this.searchInput.set_value(text); this.replaceResults(null); }
       this.startSearch(cx);
       if (text !== null) this.scheduleSearch(cx);
     } else if (name === "reveal") cx.spawn(async cx => this.reveal(cx));
@@ -131,8 +182,10 @@ export default class Explorer extends View {
     const saved = this.memory.get(placeKey(root, on));
     this.root = root; this.on = on; this.gen++;
     this.entries = new Map(); this.open = new Set(saved?.open); this.cursor = saved?.cursor ?? null;
+    this.invalidateRows();
     this.marks = {}; this.dirty = new Set(); this.error = null; this.loading = false; this.again = false;
-    this.found = []; this.frows = []; this.fsel = 0; this.results = null; this.ssel = 0;
+    this.againChanged = undefined;
+    this.found = []; this.frows = []; this.fsel = 0; this.replaceResults(null); this.ssel = 0;
     this.watchRoot(cx);
     this.refresh(cx);
     if (this.findQuery) this.ensureFiles(cx);
@@ -147,41 +200,79 @@ export default class Explorer extends View {
     cx.spawn(async cx => {
       while (this.gen === gen) {
         this.rootWatch = watchFolder(root);
-        try { await this.rootWatch; } catch { return; }  // too big to watch: the 10 s timer refreshes
+        let changed;
+        try { changed = await this.rootWatch; } catch { return; }  // too big to watch: the 10 s timer refreshes
         if (this.gen !== gen) return;
         this.files.stale = true;
         if (this.findQuery) this.ensureFiles(cx);
-        this.refresh(cx);
+        this.refresh(cx, changed);
       }
     });
   }
 
   // ---- loading the tree ----
 
-  refresh(cx) {
+  /** The folders a refresh lists: all of them for a full refresh; for a watch batch, the open
+   *  folders (and the root) that hold a changed path, and all of them when it holds the root. */
+  affected(changed) {
+    const all = ["", ...this.open];
+    if (!changed) return all;
+    if (changed.includes(this.root)) return all;
+    const parents = new Set(changed.map(dirOf));
+    return all.filter(rel => parents.has(folderAt(this.root, rel)));
+  }
+
+  /** The git checkout holding `root`, remembered per place: rev-parse runs once per root.
+   *  The pending lookup is published before it is awaited, so a second refresh of the same place
+   *  shares it; an unsuccessful probe is forgotten and tried again on the next refresh. */
+  checkout(root, on) {
+    const key = placeKey(root, on);
+    let top = this.tops.get(key);
+    if (top === undefined) { top = gitTop(root, on); this.tops.set(key, top); }
+    return Promise.resolve(top).then(result => {
+      if (result === null && this.tops.get(key) === top) this.tops.delete(key);
+      return result;
+    });
+  }
+
+  refresh(cx, changed) {
     if (!this.root) return;
     if (this.on) this.files.stale = true;  // no watch on remote spaces
-    if (this.loading) { this.again = true; return; }
-    this.loading = true; this.again = false;
-    const gen = this.gen, root = this.root, on = this.on;
+    if (this.loading) {
+      // A full refresh wins over a targeted one (null); otherwise the next pass takes every batch
+      // it missed, starting with the first one queued.
+      this.again = true;
+      if (changed == null) this.againChanged = null;
+      else if (this.againChanged !== null) this.againChanged = [...(this.againChanged ?? []), ...changed];
+      return;
+    }
+    this.loading = true; this.again = false; this.againChanged = undefined;
+    const gen = this.gen, root = this.root, on = this.on, rels = this.affected(changed);
     cx.spawn(async cx => {
       try {
-        const next = new Map();
-        for (const rel of ["", ...this.open]) {
-          if (this.gen !== gen) return;
-          try { next.set(rel, await listFolder(rel ? `${root}/${rel}` : root, on)); }
-          catch (e) { if (!rel) throw e; this.open.delete(rel); }  // a folder that went away
-        }
-        const top = await gitTop(root, on);
+        // A folder that went away closes at once, with the rows cached while it was open, so a render or
+        // key during the remaining listings cannot select one of its children.
+        const listed = await listFolders(root, on, rels, () => this.gen !== gen,
+          rel => { if (this.gen === gen && this.open.delete(rel)) this.invalidateRows(); });
+        if (this.gen !== gen) return;
+        for (const rel of listed.failed) this.open.delete(rel);  // a folder that went away
+        // Update in place: a folder opened while this ran (a reveal, a click) keeps its listing.
+        for (const [rel, list] of listed.entries) if (rel === "" || this.open.has(rel)) this.entries.set(rel, list);
+        for (const rel of [...this.entries.keys()]) if (rel && !this.open.has(rel)) this.entries.delete(rel);
+        this.invalidateRows();
+        this.error = null;
+        // The tree shows now; git status may take its time on a large checkout and lands after.
+        cx.notify();
+        const top = await this.checkout(root, on);
         const git = top ? await gitMarks(top, on) : { marks: {}, dirty: new Set() };
         if (this.gen !== gen) return;
-        // Update in place: a folder opened while this ran (a reveal, a click) keeps its listing.
-        for (const [rel, list] of next) if (rel === "" || this.open.has(rel)) this.entries.set(rel, list);
-        for (const rel of [...this.entries.keys()]) if (rel && !this.open.has(rel)) this.entries.delete(rel);
-        this.marks = git.marks; this.dirty = git.dirty; this.error = null;
+        this.marks = git.marks; this.dirty = git.dirty;
       } catch (e) { if (this.gen === gen) this.error = message(e); }
       finally {
-        if (this.gen === gen) { this.loading = false; if (this.again) this.refresh(cx); }
+        if (this.gen === gen) {
+          this.loading = false;
+          if (this.again) this.refresh(cx, this.againChanged);
+        }
         cx.notify();
       }
     });
@@ -191,7 +282,7 @@ export default class Explorer extends View {
     const gen = this.gen;
     try {
       const list = await listFolder(rel ? `${this.root}/${rel}` : this.root, this.on);
-      if (this.gen === gen && (rel === "" || this.open.has(rel))) this.entries.set(rel, list);
+      if (this.gen === gen && (rel === "" || this.open.has(rel))) { this.entries.set(rel, list); this.invalidateRows(); }
     } catch (e) { if (this.gen === gen) this.error = message(e); }
   }
 
@@ -202,16 +293,24 @@ export default class Explorer extends View {
       this.open.add(rel);
       if (!this.entries.has(rel)) cx.spawn(async cx => { await this.load(rel); cx.notify(); });
     }
+    this.invalidateRows();
   }
 
   /** Folds every folder (the toolbar's Collapse All); the cursor moves to its top folder. */
   collapseAll() {
     this.open = new Set();
     for (const rel of [...this.entries.keys()]) if (rel) this.entries.delete(rel);
+    this.invalidateRows();
     if (this.cursor) this.cursor = this.cursor.split("/")[0];
   }
 
+  /** Forgets the built row list (P6): every change that adds, removes or folds a row calls this. */
+  invalidateRows() {
+    this._rows = null;
+  }
+
   rows() {
+    if (this._rows) return this._rows;
     const out = [];
     const walk = (rel, depth) => {
       for (const e of this.entries.get(rel) ?? []) {
@@ -223,7 +322,7 @@ export default class Explorer extends View {
       }
     };
     walk("", 0);
-    return out;
+    return (this._rows = out);
   }
 
   // ---- Find files ----
@@ -298,32 +397,72 @@ export default class Explorer extends View {
   // ---- Search ----
 
   scheduleSearch(cx) {
-    const seq = ++this.seq;
-    cx.timer.after(SEARCH_DEBOUNCE, cx => { if (seq === this.seq) this.runSearch(seq, cx); });
+    this.seq++;
+    this.searchTimer?.cancel();
+    this.searchTimer = null;
+    // exec has no cancel handle: while rg runs, keep only the latest query and start it when it settles.
+    if (this.searching) { this.searchAgain = true; return; }
+    this.searchTimer = cx.timer.after(SEARCH_DEBOUNCE, cx => { this.searchTimer = null; this.runSearch(cx); });
   }
 
-  runSearch(seq, cx) {
+  runSearch(cx) {
+    const seq = this.seq;
     const query = this.searchInput.value(), root = this.root, on = this.on;
-    if (!query || !root) { this.results = null; this.searching = false; this.searchError = null; cx.notify(); return; }
-    this.searching = true; this.searchError = null;
+    if (!query || !root) { this.replaceResults(null); this.searching = false; this.searchError = null; this.searchAgain = false; cx.notify(); return; }
+    this.searching = true; this.searchError = null; this.searchAgain = false;
     cx.notify();
     const opts = { ...this.opts, include: this.includeInput.value(), exclude: this.excludeInput.value() };
     cx.spawn(async cx => {
       try {
         const results = await searchContent(root, on, query, opts);
-        if (seq === this.seq) { this.results = results; this.ssel = 0; this.collapsed = new Set(); this.rscroll.scroll_to_item(0); }
-      } catch (e) { if (seq === this.seq) { this.results = null; this.searchError = message(e); } }
-      finally { if (seq === this.seq) this.searching = false; cx.notify(); }
+        if (seq === this.seq) { this.replaceResults(results); this.ssel = 0; this.collapsed = new Set(); this.rscroll.scroll_to_item(0); }
+      } catch (e) { if (seq === this.seq) { this.replaceResults(null); this.searchError = message(e); } }
+      finally {
+        if (this.searchAgain) { this.searchAgain = false; this.runSearch(cx); return; }
+        this.searching = false;
+        cx.notify();
+      }
     });
   }
 
+  /** Forgets the built result rows (P6): every change of the results or their folds calls this. */
+  invalidateResultRows() {
+    this._resultRows = null;
+    this._resultSizes = null;
+  }
+
+  /** Replaces the result set: new results, an error, a clear, or another root. The rows' keys carry
+   *  a new revision, so a click already pressed against the old rows resolves to nothing instead of
+   *  a different match that took the same position (T6-01). Folds keep the revision, since they do
+   *  not change which result a row shows. */
+  replaceResults(results) {
+    this.results = results;
+    this.resultsRev++;
+    this.invalidateResultRows();
+  }
+
+  /** The result rows, built once per change of the results or their folds (P6). Each row carries
+   *  the key its virtual list's `on_item_click` reports: a file row, then its match rows. */
   resultRows() {
+    if (this._resultRows) return this._resultRows;
     const out = [];
     for (const f of this.results?.files ?? []) {
-      out.push({ kind: "file", path: f.path, count: f.matches.length });
-      if (!this.collapsed.has(f.path)) for (const m of f.matches) out.push({ kind: "match", path: f.path, ...m });
+      const matches = f.matches, open = !this.collapsed.has(f.path);
+      out.push({ kind: "file", key: `f:${this.resultsRev}:${f.path}`, path: f.path, count: matches.length });
+      for (let n = 0; open && n < matches.length; n++) {
+        out.push({ kind: "match", path: f.path, ...matches[n], key: `m:${this.resultsRev}:${f.path}:${n}` });
+      }
     }
-    return out;
+    return (this._resultRows = out);
+  }
+
+  /** The result rows' heights for their virtual list, one per row and built with them: a match row
+   *  is shorter than a file row, so the list cannot take a single height. */
+  resultSizes() {
+    if (this._resultSizes) return this._resultSizes;
+    const rows = this.resultRows(), sizes = new Array(rows.length);
+    for (let i = 0; i < rows.length; i++) sizes[i] = rows[i].kind === "file" ? RESULT_FILE_H : RESULT_MATCH_H;
+    return (this._resultSizes = sizes);
   }
 
   toggleOpt(name, cx) {
@@ -366,7 +505,7 @@ export default class Explorer extends View {
   move(list, by) {
     if (list === "find") {
       this.fsel = clamp(this.fsel + by, this.frows.length - 1);
-      this.rscroll.scroll_to_item(this.fsel);
+      this.fscroll.scroll_to_item(this.fsel);
     } else {
       const rows = this.resultRows();
       this.ssel = clamp(this.ssel + by, rows.length - 1);
@@ -390,15 +529,18 @@ export default class Explorer extends View {
 
   collapse(path) {
     if (this.collapsed.has(path)) this.collapsed.delete(path); else this.collapsed.add(path);
+    this.invalidateResultRows();
     const rows = this.resultRows();
     this.ssel = clamp(rows.findIndex(r => r.kind === "file" && r.path === path), rows.length - 1);
   }
 
   // ---- talking to Helix ----
 
-  /** Opens `rel` in Helix, at `at.line`/`at.col` when given (Helix's :open takes path:line:col). */
+  /** Opens `rel` in Helix, at `at.line`/`at.col` when given (Helix's :open takes path:line:col).
+   *  A search row from far into a long non-ASCII line carries its column unresolved; opening it
+   *  is where that exact column is computed. */
   openFile(rel, focus, cx, at) {
-    const path = `${this.root}/${rel}${at ? `:${at.line}:${at.col}` : ""}`;
+    const path = `${this.root}/${rel}${at ? `:${at.line}:${columnOf(at)}` : ""}`;
     cx.spawn(async cx => {
       try {
         const sent = await this.router.open(path, { folder: this.root, focus, sleep: ms => cx.sleep(ms) });
@@ -417,18 +559,55 @@ export default class Explorer extends View {
     if (r?.code !== 0) return;
     this.runtime = r.stdout;
     this.router.runtime = this.runtime;  // lets the router queue files without a shell
+    await this.pendingCommand(cx);  // a find/search asked for before the panel started
     for (;;) {
       let changed;
       try { changed = await watchFolder(this.runtime); } catch { await cx.sleep(5000); continue; }
+      if (changed.some(p => p === this.runtime || p.endsWith("/command"))) await this.pendingCommand(cx);
       if (changed.some(p => p === this.runtime || p.endsWith("/reveal"))) await this.reveal(cx);
+    }
+  }
+
+  /** The text of a request file bin/herdr-explorer wrote (a temp file renamed into place) once:
+   *  null when it is missing, or is the one `last` already handled. */
+  async readRequest(name, last) {
+    if (!this.runtime) return null;
+    const text = await readTextFile(`${this.runtime}/${name}`).catch(() => null);
+    return text && text !== last ? text : null;
+  }
+
+  /** Applies the Find files / Search request bin/herdr-explorer left behind, if it is new and
+   *  recent: the CLI does not wait for the panel to start, and skips the mod when it already ran.
+   *  A wake or watch batch that arrives while a read is in flight asks for one more read, so a
+   *  request renamed into place mid-read is not missed. */
+  async pendingCommand(cx) {
+    if (this.readingCommand) { this.commandAgain = true; return; }
+    this.readingCommand = true;
+    try {
+      const text = await this.readRequest("command", this.lastCommand);
+      if (!text) return;
+      this.lastCommand = text;
+      // Framing (bin/herdr-explorer): command, 1/0 for a text argument, timestamp, then the text,
+      // which may hold tabs of its own. A timestamp is not read as text or the other way round.
+      const line = text.replace(/\n$/, "");
+      const a = line.indexOf("\t"), b = line.indexOf("\t", a + 1), c = line.indexOf("\t", b + 1);
+      if (a < 0 || b < 0 || c < 0) return;
+      const name = line.slice(0, a), present = line.slice(a + 1, b), stamp = line.slice(b + 1, c);
+      const arg = line.slice(c + 1);
+      if (!(Date.now() - Number(stamp) <= PENDING_MAX_AGE)) return;
+      localStorage.setItem(HANDLED_COMMAND, text);
+      this.command(present === "1" ? `${name}:${arg}` : name, cx);
+      cx.notify();
+    } finally {
+      this.readingCommand = false;
+      if (this.commandAgain) { this.commandAgain = false; cx.spawn(async cx => this.pendingCommand(cx)); }
     }
   }
 
   /** Shows the file a Helix asked for (bin/herdr-explorer reveal) and pairs with that Helix. */
   async reveal(cx) {
-    if (!this.runtime) return;
-    const text = await readTextFile(`${this.runtime}/reveal`).catch(() => null);
-    if (!text || text === this.lastReveal) return;
+    const text = await this.readRequest("reveal", this.lastReveal);
+    if (!text) return;
     this.lastReveal = text;
     const [id, path] = text.replace(/\n$/, "").split("\t");
     if (!path?.startsWith("/")) return;
@@ -439,12 +618,23 @@ export default class Explorer extends View {
     }
     if (this.view === "search" || this.findQuery) { this.view = "tree"; this.clearFind(); }
     const rel = path.slice(this.root.length + 1), parts = rel.split("/");
-    if (!this.entries.has("")) await this.load("");
-    for (let k = 1; k < parts.length; k++) {
-      const dir = parts.slice(0, k).join("/");
-      this.open.add(dir);
-      if (!this.entries.has(dir)) await this.load(dir);
+    // The root and every folder above the file, listed together by the refresh helper instead of
+    // one at a time: on a remote space each listing is a round trip of its own (P9).
+    const gen = this.gen, root = this.root, on = this.on, ancestors = [""];
+    for (let k = 1; k < parts.length; k++) ancestors.push(parts.slice(0, k).join("/"));
+    for (const dir of ancestors) if (dir) this.open.add(dir);
+    const missing = ancestors.filter(dir => !this.entries.has(dir));
+    if (missing.length) {
+      // A folder that cannot be listed says why in the tree note, as load() did. A failed root
+      // listing keeps the ancestors that did list: a refresh may already have the root, and the
+      // file can still be shown and scrolled to.
+      const listed = await listFolders(root, on, missing, () => this.gen !== gen,
+        (dir, e) => { if (this.gen === gen) this.error = message(e); }, true);
+      if (this.gen !== gen) return;  // the root moved on, and its refresh owns the tree now
+      if (listed.error) this.error = message(listed.error);
+      for (const [dir, list] of listed.entries) if (dir === "" || this.open.has(dir)) this.entries.set(dir, list);
     }
+    this.invalidateRows();
     this.cursor = rel;
     const i = this.rows().findIndex(r => r.path === rel);
     if (i >= 0) this.scroll.scroll_to_item(i);
@@ -488,18 +678,18 @@ export default class Explorer extends View {
     if (list === "search") return;
     const count = list === "tree" ? this.rows().length : this.frows.length;
     if (!count) return;
-    const scroll = list === "tree" ? this.scroll : this.rscroll;
-    const [first, last] = this.visibleRange(scroll, count, this.listNote(list) ? ROW_H : 0);
+    const scroll = list === "tree" ? this.scroll : this.fscroll;
+    const [first, last] = this.visibleRange(scroll, count);
     const labels = jumpLabels(last - first + 1), at = new Map(), byIndex = new Map();
     labels.forEach((l, n) => { at.set(l, first + n); byIndex.set(first + n, l); });
     this.jump = { list, at, byIndex, typed: "" };
   }
 
-  /** The rows at least half on screen. `top`: the height of a note above the rows. */
-  visibleRange(scroll, count, top) {
+  /** The rows at least half on screen. The list holds only rows, so no note or padding is above them. */
+  visibleRange(scroll, count) {
     const fallback = [0, Math.min(count, JUMP_ALPHABET.length) - 1];
     if (typeof scroll.offset !== "function") return fallback;
-    const y = scroll.offset().y - LIST_PAD - top, h = scroll.viewport_size().height;
+    const y = scroll.offset().y, h = scroll.viewport_size().height;
     if (!(h > 0)) return fallback;
     const first = clamp(Math.ceil((y - ROW_H / 2) / ROW_H), count - 1);
     const last = clamp(Math.floor((y + h - ROW_H / 2) / ROW_H), count - 1);
@@ -512,7 +702,7 @@ export default class Explorer extends View {
     if (hits.length === 1 && hits[0] === typed) {
       this.jump = null;
       const i = jump.at.get(typed);
-      if (jump.list === "find") { this.fsel = clamp(i, this.frows.length - 1); this.rscroll.scroll_to_item(this.fsel); }
+      if (jump.list === "find") { this.fsel = clamp(i, this.frows.length - 1); this.fscroll.scroll_to_item(this.fsel); }
       else { const row = this.rows()[i]; if (row) { this.cursor = row.path; this.scroll.scroll_to_item(i); } }
     } else if (hits.length) jump.typed = typed;
     else this.jump = null;  // Esc or a key that is no label
@@ -607,7 +797,7 @@ export default class Explorer extends View {
         break;
       case "/": this.startFind(cx, e.key_char); break;
       case "?": case "shift-/": this.startSearch(cx, e.key_char); break;
-      case ".": this.showHidden = !this.showHidden; break;
+      case ".": this.showHidden = !this.showHidden; this.invalidateRows(); break;
       case "r": this.refresh(cx); break;
       case "escape": case "q": this.router.focusEditor(); break;
       default: return;  // anything else (Herdr's own keys) passes through
@@ -637,7 +827,7 @@ export default class Explorer extends View {
 
   /** One row of the tree or of the Find files matches: chevron, folder or file icon, name, git mark. */
   /** `label`: its gw label, drawn over the start of the name like Helix's; `jumping` dims the rest. */
-  nodeRow(r, { id, open, selected, active, hits, onClick, label, jumping }, t) {
+  nodeRow(r, { id, open, selected, active, hits, label, jumping }, t) {
     const abs = `${this.root}/${r.path}`, mark = this.marks[abs], dirty = r.dir && this.dirty.has(abs);
     const color = jumping ? t.muted : mark ? this.markColor(mark, t) : dirty ? t.ansi3 : t.foreground;
     const name = label ? h_flex().min_w(0).overflow_hidden()
@@ -645,11 +835,10 @@ export default class Explorer extends View {
         .child(div().min_w(0).truncate().text_color(color).child(r.name.slice(label.length)))
       : hits?.length && !jumping ? this.spans(r.name, hits, t, color)
       : div().min_w(0).truncate().text_color(color).child(r.name);
-    return h_flex().id(id).h(24).flex_none().w_full().pl(8 + r.depth * 16).pr(8).gap(4).items_center()
+    return h_flex().id(id).h(ROW_H).flex_none().w_full().pl(8 + r.depth * 16).pr(8).gap(4).items_center()
       .rounded(4).border_1().border_color(selected ? t.border : CLEAR).cursor_pointer().text_size(12)
       .when(selected, el => el.bg(active ? t.selected : t.hover))
       .when(!selected, el => el.hover(s => s.bg(t.hover)))
-      .on_click(onClick)
       .drag_paths([abs], { on: this.on })
       .child(r.dir ? svg(ICON(open ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.muted) : div().size(12).flex_none())
       .child(svg(ICON(r.dir ? (open ? "folder-open" : "folder") : "file")).size(12).flex_none().text_color(t.muted))
@@ -663,13 +852,6 @@ export default class Explorer extends View {
     return this.nodeRow(r, {
       id: `row-${r.path}`, open: this.open.has(r.path), selected: first || r.path === this.cursor, active,
       label: this.labelFor("tree", i), jumping: this.jump?.list === "tree",
-      onClick: (_e, cx) => {
-        this.jump = this.pending = null;
-        this.cursor = r.path;
-        this.handle.focus();
-        if (r.dir) this.toggle(r.path, cx); else this.openFile(r.path, true, cx);
-        cx.notify();
-      },
     }, t);
   }
 
@@ -677,13 +859,75 @@ export default class Explorer extends View {
     return this.nodeRow(r, {
       id: `found-${r.path}`, open: r.dir && !this.fclosed.has(r.path), selected: i === this.fsel, active, hits: r.hits,
       label: this.labelFor("find", i), jumping: this.jump?.list === "find",
-      onClick: (_e, cx) => {
-        this.jump = this.pending = null;
-        this.fsel = i;
-        if (r.dir) this.toggleFiltered(r.path); else this.openFile(r.path, true, cx);
-        cx.notify();
-      },
     }, t);
+  }
+
+  /** A tree row's click, from the virtual list's `on_item_click` (keyed by row path). */
+  clickTree(path, cx) {
+    this.jump = this.pending = null;
+    this.cursor = path;
+    this.handle.focus();
+    const row = this.rows().find(r => r.path === path);
+    if (row?.dir) this.toggle(path, cx); else if (row) this.openFile(path, true, cx);
+    cx.notify();
+  }
+
+  /** A Find files row's click, from its virtual list's `on_item_click` (keyed by row path). */
+  clickFound(path, cx) {
+    this.jump = this.pending = null;
+    const i = this.frows.findIndex(r => r.path === path);
+    if (i < 0) return;
+    const row = this.frows[i];
+    this.fsel = i;
+    if (row.dir) this.toggleFiltered(path); else this.openFile(path, true, cx);
+    cx.notify();
+  }
+
+  /** A virtual row area's shared wiring (P2): the list — `sizes` is one height or one per row —
+   *  its paired scrollbar, and clicks keyed by row, inside `area`. */
+  virtualRows(area, { id, rows, sizes, scroll, onClick, build }) {
+    return area
+      .child(v_virtual_list(id, rows.length, sizes,
+        i => rows[i]?.key ?? rows[i]?.path ?? String(i), build)
+        .size_full().track_scroll(scroll)
+        .on_item_click((key, cx) => onClick(key, cx)))
+      .child(Scrollbar.vertical(id).absolute().inset_0());
+  }
+
+  /** The tree or Find files rows as a virtual list: only the visible range is built (P2). */
+  rowList(kind, rows, t, active, first, scroll) {
+    const id = `herdr-explorer-${kind}-rows`;
+    return this.virtualRows(div().relative().flex_1().min_h(0).px(4).py(LIST_PAD), {
+      id, rows, sizes: ROW_H, scroll,
+      onClick: (key, cx) => (kind === "tree" ? this.clickTree(key, cx) : this.clickFound(key, cx)),
+      build: range => rows.slice(range.start, range.end).map((r, n) => {
+        const i = range.start + n;
+        return kind === "tree" ? this.treeRow(r, i, t, active, first && i === 0)
+          : this.foundRow(r, i, t, active);
+      }),
+    });
+  }
+
+  /** The search result rows as a virtual list of two heights: a file row, then its match rows. */
+  resultList(rows, t, active) {
+    const id = "herdr-explorer-search-rows";
+    return this.virtualRows(div().relative().flex_1().min_h(0).pb(LIST_PAD), {
+      id, rows, sizes: this.resultSizes(), scroll: this.rscroll,
+      onClick: (key, cx) => this.clickResult(key, cx),
+      build: range => rows.slice(range.start, range.end)
+        .map((r, n) => this.resultRow(r, range.start + n, t, active)),
+    });
+  }
+
+  /** A search result row's click, from its virtual list's `on_item_click` (keyed by row). */
+  clickResult(key, cx) {
+    this.jump = this.pending = null;
+    const rows = this.resultRows(), i = rows.findIndex(r => r.key === key);
+    if (i < 0) return;
+    this.ssel = i;
+    const row = rows[i];
+    if (row.kind === "file") this.collapse(row.path); else this.openFile(row.path, true, cx, row);
+    cx.notify();
   }
 
   resultRow(r, i, t, active) {
@@ -693,7 +937,6 @@ export default class Explorer extends View {
     if (r.kind === "file") {
       const open = !this.collapsed.has(r.path), dir = parentOf(r.path);
       return div().w_full().flex_none().pt(6).child(base.h(22).px(8)
-        .on_click((_e, cx) => { this.ssel = i; this.collapse(r.path); cx.notify(); })
         .drag_paths([`${this.root}/${r.path}`], { on: this.on })
         .tooltip(r.path)
         .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.muted))
@@ -710,7 +953,6 @@ export default class Explorer extends View {
     const shown = before + r.text.slice(first), shift = before.length - first;
     const ranges = r.ranges.map(([s, e]) => [Math.max(0, s + shift), Math.max(0, e + shift)]);
     return base.min_h(18).py(1).pl(28).pr(8)
-      .on_click((_e, cx) => { this.ssel = i; this.openFile(r.path, true, cx, r); cx.notify(); })
       .child(div().flex_none().text_size(10).text_color(t.muted).child(String(r.line)))
       .child(div().flex_1().min_w(0).overflow_hidden().text_size(12).child(this.spans(shown, ranges, t, t.muted)));
   }
@@ -766,7 +1008,7 @@ export default class Explorer extends View {
         .border_1().border_color(t.border).shadow_md().text_size(12)
         .child(h_flex().id("explorer-dotfiles").h(32).px(8).gap(8).items_center().rounded(4).cursor_pointer()
           .text_color(t.foreground).hover(s => s.bg(t.hover))
-          .on_click((_e, cx) => { this.showHidden = !this.showHidden; this.menuOpen = false; cx.notify(); })
+          .on_click((_e, cx) => { this.showHidden = !this.showHidden; this.invalidateRows(); this.menuOpen = false; cx.notify(); })
           .child(div().size(14).flex_none().when(this.showHidden, el => el.child(svg(ICON("check")).size(14).text_color(t.foreground))))
           .child(div().flex_1().child("Show Dotfiles"))
           .child(div().text_size(11).text_color(t.dim).child("."))));
@@ -812,7 +1054,7 @@ export default class Explorer extends View {
     const o = this.opts, extra = [];
     if (this.searching) extra.push(this.spinner(t));
     if (this.searchInput.value()) extra.push(this.clearButton("search-clear", "Clear search", cx => {
-      this.searchInput.set_value(""); this.results = null; this.searchError = null; this.scheduleSearch(cx);
+      this.searchInput.set_value(""); this.replaceResults(null); this.searchError = null; this.scheduleSearch(cx);
     }, t));
     extra.push(
       this.toggleButton("opt-case", "case-sensitive", o.caseSensitive, "Match Case (alt-c)", cx => this.toggleOpt("caseSensitive", cx)),
@@ -859,14 +1101,15 @@ export default class Explorer extends View {
     const body = [];
     if (mode === "tree") {
       const rows = this.rows(), note = this.listNote("tree");
-      body.push(v_flex().id("herdr-explorer-tree").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.scroll).px(4).py(8)
+      const first = active && !rows.some(r => r.path === this.cursor);  // no cursor: the top row is it
+      body.push(v_flex().id("herdr-explorer-tree").flex_1().min_h(0)
         .when(Boolean(note), el => el.child(this.note(note, t, this.error ? t.ansi1 : null)))
-        .children(rows.map((r, i) => this.treeRow(r, i, t, active, r === rows[0] && active && !rows.some(x => x.path === this.cursor)))));
+        .child(this.rowList("tree", rows, t, active, first, this.scroll)));
     } else if (mode === "find") {
       const note = this.listNote("find");
-      body.push(v_flex().id("herdr-explorer-found").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.rscroll).px(4).py(8)
+      body.push(v_flex().id("herdr-explorer-found").flex_1().min_h(0)
         .when(Boolean(note), el => el.child(this.note(note, t, this.files.error ? t.ansi1 : null)))
-        .children(this.frows.map((r, i) => this.foundRow(r, i, t, active))));
+        .child(this.rowList("find", this.frows, t, active, false, this.fscroll)));
     } else {
       const res = this.results, rows = this.resultRows();
       if (!this.searchError && res && (rows.length || res.truncated)) {
@@ -874,10 +1117,10 @@ export default class Explorer extends View {
         body.push(div().flex_none().px(8).py(4).text_size(11).text_color(t.muted).border_b(1).border_color(t.border)
           .child(`${n(res.total, "result")} in ${n(res.files.length, "file")}${res.truncated ? " (results truncated)" : ""}`));
       }
-      body.push(v_flex().id("herdr-explorer-results").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.rscroll).pb(8)
+      body.push(v_flex().id("herdr-explorer-results").flex_1().min_h(0)
         .when(Boolean(this.searchError), el => el.child(div().p(8).text_size(12).text_color(t.ansi1).child(this.searchError)))
         .when(!this.searchError && res && !res.total, el => el.child(this.note("No results", t)))
-        .when(!this.searchError, el => el.children(rows.map((r, i) => this.resultRow(r, i, t, active)))));
+        .when(!this.searchError && rows.length > 0, el => el.child(this.resultList(rows, t, active))));
     }
     return v_flex().id("herdr-explorer").track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(active ? t.accent : t.border)

@@ -8,6 +8,9 @@
 #   herdr-explorer find [TEXT]   open the explorer panel on Find files
 #   herdr-explorer search [TEXT] open the explorer panel on Search (file contents)
 #
+# find and search publish a request in the runtime folder for the explorer to read (at its start
+# or when woken), so neither waits for the panel.
+#
 # Files live in $XDG_RUNTIME_DIR/herdr-explorer, keyed by HC_TERMINAL_ID (set in every hc terminal).
 set -eu
 dir="${XDG_RUNTIME_DIR:-/tmp}/herdr-explorer"
@@ -33,14 +36,20 @@ case "${1:-}" in
     herdr-app do herdr-explorer.reveal >/dev/null 2>&1 || true
     ;;
   find|search)
-    # Show the explorer in herdr-factory's side panel (Files slot), then start Find files or Search.
-    herdr-app do layout.select '{"stack":"panel-body","child":"files"}' >/dev/null 2>&1 || true
-    herdr-app do layout.show '{"id":"panel"}' >/dev/null 2>&1 || true
-    sleep 0.3  # a panel shown for the first time starts its mod now
     [ "$1" = find ] && cmd=find-files || cmd=search
     shift
-    [ $# -gt 0 ] && cmd="$cmd:$*"  # start with this text (Helix: %{selection}, say)
-    herdr-app do "herdr-explorer.$cmd" >/dev/null 2>&1 || true
+    # Frame the text apart from the timestamp (the text may hold tabs) and record whether an
+    # argument was given at all, so an explicit empty one clears the query and none leaves it.
+    [ $# -gt 0 ] && present=1 || present=0
+    mkdir -p "$dir"
+    tmp="$dir/command.$$.tmp"  # one per invocation: concurrent CLIs must not share it
+    printf '%s\t%s\t%s\t%s\n' "$cmd" "$present" "$(date +%s%3N)" "$*" > "$tmp"  # text: %{selection}, say
+    mv -f "$tmp" "$dir/command"
+    # Publish first: a panel shown for the first time starts its mod after this returns, so the
+    # request must already be there for the mod to read at its start (and again on the wake).
+    herdr-app do layout.select '{"stack":"panel-body","child":"files"}' >/dev/null 2>&1 || true
+    herdr-app do layout.show '{"id":"panel"}' >/dev/null 2>&1 || true
+    herdr-app do herdr-explorer.pending >/dev/null 2>&1 || true
     ;;
   *)
     echo "usage: herdr-explorer take | reveal PATH | find | search" >&2

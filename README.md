@@ -21,7 +21,9 @@ Herdr's `main` layout plus:
 |---|---|
 | `layouts/herdr-factory.json` | The window: sidebar (spaces, agents), tab bar, panes, Files/Changes panel, status bar |
 | `layouts/herdr-factory.svg` | Its preview in Herdr's settings |
-| `mods/factory-tabs/` | Clone of Herdr's `tabs`: + opens `factory-new-menu` |
+| `mods/factory-spaces/` | Clone of Herdr's `spaces`: right-click opens `factory-menu` |
+| `mods/factory-menu/` | Clone of `menu`: a space's New, Open and Remove worktree open `factory-worktree` |
+| `mods/factory-tabs/` | Clone of Herdr's `tabs`: + opens `factory-new-menu`, right-click opens `factory-menu` |
 | `mods/factory-new-menu/` | Clone of `new-menu`: adds **Claude (ACP)**; New and Open worktree open `factory-worktree` |
 | `mods/factory-worktree/` | Clone of `worktree`: New worktree picks the branch it starts from; see its README |
 | `mods/factory-agents/` | Clone of `agents`: lists detached ACP bridges (`acp-view.tab` label) |
@@ -83,6 +85,5 @@ Some mods also need setup outside this repo:
   see detached ACP sessions (`acp-view` shows its own notifications).
 - `ctrl-shift-a` ACP panes still start a bridge with a terminal pane, as in
   Herdr's `main` layout.
-- New worktree from a space's right-click menu (Herdr's `menu` mod, opened by
-  `spaces`) still opens Herdr's `worktree`, without the start-point picker. Only
-  the tab bar's + menu opens `factory-worktree`.
+- Right-clicking a pane still opens Herdr's own `menu` (the `pane` mod opens
+  it); it has no worktree items, so nothing is lost.

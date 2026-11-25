@@ -17,7 +17,8 @@ from `HEAD`.
 - The dialog's path preview shows where the worktree will be created.
 - A caller that creates at once can pass `{ branch, base }` in props.
 
-`factory-new-menu` opens it at 460×420 so the six-row list fits. Open and Remove
+`factory-new-menu` (tab bar +) and `factory-menu` (a space's right-click menu) open
+it, New worktree at 460×420 so the six-row list fits. Open and Remove
 work as in Herdr's mod.
 
 After a Herdr update, compare `main.js` with `~/.config/herdr-app/mods/worktree/main.js`

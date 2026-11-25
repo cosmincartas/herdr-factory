@@ -365,12 +365,12 @@ export default class Worktree extends View {
     return v_flex()
       .gap(6)
       .child(
-        h_flex()
-          .gap(8)
-          .items_center()
-          .child(Input.new(this.baseInput).flex_1().h(28).px(10).items_center().rounded(6).border(1).border_color(this.baseFocused ? t.accent : t.input).bg(t.background).text_color(t.foreground))
-          // A fixed slot, wide enough for "1000/1000 of 1000": the filter must not resize as the numbers change.
-          .child(h_flex().flex_none().w(104).justify_end().child(div().text_size(11).text_color(t.dim).child(count))),
+        // The same size as the branch name's input above it, with the counter drawn inside on the right.
+        div()
+          .relative()
+          .child(Input.new(this.baseInput).h(32).pl(10).pr(118).items_center().rounded(6).border(1).border_color(this.baseFocused ? t.accent : t.input).bg(t.background).text_color(t.foreground))
+          // A fixed slot, wide enough for "1000/1000 of 1000": the text must not run under it as the numbers change.
+          .child(h_flex().absolute().top_0().bottom_0().right(10).w(104).items_center().justify_end().child(div().text_size(11).text_color(t.dim).child(count))),
       )
       .child(
         div()

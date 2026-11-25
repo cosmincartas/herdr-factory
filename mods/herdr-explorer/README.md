@@ -84,6 +84,10 @@ herdr-explorer find [TEXT]     # shows herdr-factory's side panel, starts Find f
 herdr-explorer search [TEXT]   # same, on Search
 ```
 
+Both return at once: they leave the request in `$XDG_RUNTIME_DIR/herdr-explorer/command` and
+wake the explorer, which reads it when the panel's mod starts (a request more than 5 s old is
+ignored, so a leftover cannot resurface, and one already applied is not applied again on restart).
+
 Herdr keys can start them too, while the panel is shown (`keys.json` actions only reach shown mods):
 `"herdr-explorer.find-files"`, `"herdr-explorer.search"`.
 
@@ -139,10 +143,27 @@ At the top of `router.js`:
   taken the file after this many ms (a picker or prompt is open), `esc` and the key follow.
 - `EDITOR_ARGV`: what a new editor pane runs.
 
+## Development
+
+The tests are Node's test runner, with `herdr`, `gpui-kit` and `gpui-base` mapped to the stubs in
+`test/stubs/`, so the real `Explorer` runs in Node (render included). Node 22.15 or later is
+needed, and `herdr-app` must be on `PATH` for the budget runs.
+
+```sh
+node --import ./test/hooks.mjs --test test/   # unit tests
+sh test/budget.sh tree-50                     # render budget, on a copy of the mod
+```
+
+`test/budget.sh SCENARIO` copies the mod (without `test/`) to a temp folder, renames `main.js` to
+`explorer.js` and installs `test/budget/SCENARIO.js` as `main.js`; the scenario subclasses
+`Explorer`, seeds state, and `herdr-app check` loads it. Exit 1 with `interrupted` means the
+seeded work is over the host's budget.
+
 ## Limits
 
 - Remote spaces are untested. A Helix on another machine needs `herdr-explorer` on that
   machine's `PATH` to receive files, and can't reveal (Herdr's folder watch is local only).
-- Up to 500 entries per folder and 5,000 rows.
+- Up to 500 entries per folder and 5,000 rows in the tree. The tree and Find files build only the
+  rows on screen, so a long list scrolls smoothly.
 - Find files lists up to 50,000 files and shows the best 200 matches.
 - No file operations (create, rename, delete) or replace yet.
